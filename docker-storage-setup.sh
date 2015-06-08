@@ -82,8 +82,10 @@ create_metadata_lv() {
   # Calculating the based on actual data size might be better, but is
   # more difficult do to the range of possible inputs.
   VG_SIZE=$( vgs --noheadings --nosuffix --units s -o vg_size $VG )
-  META_SIZE=$(( $VG_SIZE / 1000 + 1 ))
-  if [ ! -n "$META_LV_SIZE" ]; then
+  if [ -n "$VG_SIZE" ]; then
+    META_SIZE=$(( $VG_SIZE / 1000 + 1 ))
+  fi
+  if [ -n "$META_SIZE" ]; then
     lvcreate -L ${META_SIZE}s -n $META_LV_NAME $VG
   fi
 }
