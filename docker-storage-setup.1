@@ -10,7 +10,11 @@ docker\-storage\-setup - Grows the root filesystem and sets up a LVM thin pool f
 None. 
 .SH EXAMPLES
 Run \f[B]docker-storage-setup\f[] after setting up your configuration in 
-/etc/sysconfig/docker-storage-setup. 
+/etc/sysconfig/docker-storage-setup. One can look at
+/usr/lib/docker-storage-setup/docker-storage-setup for various options and
+their default settings. Anything user wants to change, should be changed
+in /etc/sysconfig/docker-storage-setup. This is the file which will
+override any settings specified in /usr/lib/docker-storage-setup/docker-storage-setup.
 
 lvm2 version should be same or higher than lvm2-2.02.112 for lvm thin pool
 functionality to work properly.
@@ -31,13 +35,45 @@ VG:   The volume group to use for docker storage.  Defaults to the
       lvm2 version should be same or higher than lvm2-2.02.112 for lvm
       thin pool functionality to work properly.
 
+GROWPART:
+      One can use this option to enable/disable growing of partition
+      table backing root volume group. This is intended for virtualization
+      and cloud installations. By default it is disabled. Use GROWPART=true
+      to enable automatic partition table resizing.
+
+AUTO_EXTEND_POOL:
+      Enable automatic extension of pool by lvm. lvm can monitor
+      the pool and automatically extend it when pool is getting full.
+
+POOL_AUTOEXTEND_THRESHOLD:
+      Determines the pool extension threshold in terms of percentage
+      of pool size. For example, if threhold is 60, that means when
+      pool is 60% full, threshold has been hit.
+
+POOL_AUTOEXTEND_PERCENT:
+      Determines the amount by which pool needs to be grown. This is
+      specified in terms of % of pool size. So a value of 20 means
+      that when threhold is hit, pool will be grown by 20% of existing
+      pool size.
+
+CHUNK_SIZE:
+      Controls the chunk size/block size of thin pool. Value of CHUNK_SIZE
+      be suitable to be passed to --chunk-size option of lvconvert.
+
 The options below should be specified as values acceptable to 'lvextend -L':
 
 ROOT_SIZE: The size to which the root filesystem should be grown.
 
 DATA_SIZE: The desired size for the docker data LV.  Defaults to using
-           all free space in the VG after the root LV and docker
+           60% free space in the VG after the root LV and docker
            metadata LV have been allocated/grown.
+
+           DATA_SIZE can take values acceptable to "lvcreate -L" as
+           well as some values acceptable to to "lvcreate -l". If user
+           intends to pass values acceptable to "lvcreate -l", then
+           only those values which contains "%" in syntax are
+           acceptable.  If value does not contain "%" it is assumed
+           value is suitable for "lvcreate -L".
 
 
 \f[B]Sample\f[]

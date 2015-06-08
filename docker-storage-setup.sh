@@ -57,12 +57,6 @@ POOL_LV_NAME="docker-pool"
 DATA_LV_NAME=$POOL_LV_NAME
 META_LV_NAME="${POOL_LV_NAME}meta"
 
-# LVM thin pool expect some space free in volume group so that it can manage
-# internal spare logical volume used for thin meta data repair. Currently
-# we use .1% of VG size as meta volume size. So 2% of VG size should be
-# good enough for spare volume.
-DEFAULT_DATA_SIZE_PERCENT="98"
-
 DOCKER_STORAGE="/etc/sysconfig/docker-storage"
 
 write_storage_config_file () {
@@ -76,10 +70,11 @@ write_storage_config_file () {
     fi
     done )
 
-  storage_options="DOCKER_STORAGE_OPTIONS=--storage-opt dm.fs=xfs --storage-opt dm.thinpooldev=$POOL_DEVICE_PATH"
-cat <<EOF > $DOCKER_STORAGE
+  storage_options="DOCKER_STORAGE_OPTIONS=-s devicemapper --storage-opt dm.fs=xfs --storage-opt dm.thinpooldev=$POOL_DEVICE_PATH"
+cat <<EOF > $DOCKER_STORAGE.tmp
 $storage_options
 EOF
+  mv $DOCKER_STORAGE.tmp $DOCKER_STORAGE
 }
 
 create_metadata_lv() {
@@ -87,22 +82,25 @@ create_metadata_lv() {
   # Calculating the based on actual data size might be better, but is
   # more difficult do to the range of possible inputs.
   VG_SIZE=$( vgs --noheadings --nosuffix --units s -o vg_size $VG )
-  META_SIZE=$(( $VG_SIZE / 1000 + 1 ))
-  if [ ! -n "$META_LV_SIZE" ]; then
+  if [ -n "$VG_SIZE" ]; then
+    META_SIZE=$(( $VG_SIZE / 1000 + 1 ))
+  fi
+  if [ -n "$META_SIZE" ]; then
     lvcreate -L ${META_SIZE}s -n $META_LV_NAME $VG
   fi
 }
 
 create_data_lv() {
-  if [ -n "$DATA_SIZE" ]; then
-    # TODO: Error handling when DATA_SIZE > available space.
-    if [[ $DATA_SIZE == *%* ]]; then
-      lvcreate -l $DATA_SIZE -n $DATA_LV_NAME $VG
-    else
-      lvcreate -L $DATA_SIZE -n $DATA_LV_NAME $VG
-    fi
+  if [ ! -n "$DATA_SIZE" ]; then
+    echo "Data volume creation failed. No DATA_SIZE specified"
+    exit 1
+  fi
+
+  # TODO: Error handling when DATA_SIZE > available space.
+  if [[ $DATA_SIZE == *%* ]]; then
+    lvcreate -l $DATA_SIZE -n $DATA_LV_NAME $VG
   else
-    lvcreate -l "$DEFAULT_DATA_SIZE_PERCENT%FREE" -n $DATA_LV_NAME $VG
+    lvcreate -L $DATA_SIZE -n $DATA_LV_NAME $VG
   fi
 }
 
@@ -111,28 +109,16 @@ create_lvm_thin_pool () {
   create_metadata_lv
   create_data_lv
 
-  lvconvert -y --zero n --thinpool $VG/$DATA_LV_NAME --poolmetadata $VG/$META_LV_NAME
-}
-
-# If user specified DATA_SIZE and current pool is smaller, extend it.
-extend_data_lv () {
-  # TODO: Figure out failure cases other than when the requested
-  # size is larger than the current size.  For now, we just let
-  # lvextend fail.
-  if [ -n "$DATA_SIZE" ]; then
-    if [[ $DATA_SIZE == *%* ]]; then
-      lvextend -l $DATA_SIZE $VG/$DATA_LV_NAME || true
-    else
-      lvextend -L $DATA_SIZE $VG/$DATA_LV_NAME || true
-    fi
+  if [ -n "$CHUNK_SIZE" ]; then
+    CHUNK_SIZE_ARG="-c $CHUNK_SIZE"
   fi
+  lvconvert -y --zero n $CHUNK_SIZE_ARG --thinpool $VG/$DATA_LV_NAME --poolmetadata $VG/$META_LV_NAME
 }
 
 setup_lvm_thin_pool () {
   if ! lvm_pool_exists; then
     create_lvm_thin_pool
-  else
-    extend_data_lv
+    write_storage_config_file
   fi
 }
 
@@ -171,8 +157,120 @@ is_old_data_meta_mode() {
   return 0
 }
 
+grow_root_pvs() {
+  [ -x "/usr/bin/growpart" ] || return 0
+
+  # Grow root pvs only if user asked for it through config file.
+  [ "$GROWPART" != "true" ] && return
+
+  # Note that growpart is only variable here because we may someday support
+  # using separate partitions on the same disk.  Today we fail early in that
+  # case.  Also note that the way we are doing this, it should support LVM
+  # RAID for the root device.  In the mirrored or striped case, we are growing
+  # partitions on all disks, so as long as they match, growing the LV should
+  # also work.
+  for pv in $ROOT_PVS; do
+    # Split device & partition.  Ick.
+    growpart $( echo $pv | sed -r 's/([^0-9]*)([0-9]+)/\1 \2/' ) || true
+    pvresize $pv
+  done
+}
+
+create_disk_partitions() {
+  for dev in $DEVS; do
+    if expr match $dev ".*[0-9]"; then
+      echo "Partition specification unsupported at this time." >&2
+      exit 1
+    fi
+    if [[ $dev != /dev/* ]]; then
+      dev=/dev/$dev
+    fi
+    # Use a single partition of a whole device
+    # TODO:
+    #   * Consider gpt, or unpartitioned volumes
+    #   * Error handling when partition(s) already exist
+    #   * Deal with loop/nbd device names. See growpart code
+    PARTS=$( awk "\$4 ~ /"$( basename $dev )"[0-9]/ { print \$4 }" /proc/partitions )
+    if [ -n "$PARTS" ]; then
+      echo "$dev has partitions: $PARTS"
+      exit 1
+    fi
+    size=$(( $( awk "\$4 ~ /"$( basename $dev )"/ { print \$3 }" /proc/partitions ) * 2 - 2048 ))
+    cat <<EOF | sfdisk $dev
+unit: sectors
+
+${dev}1 : start=     2048, size=  ${size}, Id=8e
+EOF
+    pvcreate ${dev}1
+    PVS="$PVS ${dev}1"
+  done
+}
+
+create_extend_volume_group() {
+  if [ -z "$VG_EXISTS" ]; then
+    vgcreate $VG $PVS
+  else
+    # TODO:
+    #   * Error handling when PV is already part of a VG
+    vgextend $VG $PVS
+  fi
+}
+
+# Auto extension logic. Create a profile for pool and attach that profile
+# the pool volume.
+enable_auto_pool_extension() {
+  local volume_group=$1
+  local pool_volume=$2
+  local profileName="${volume_group}--${pool_volume}-extend"
+  local profileFile="${profileName}.profile"
+  local profileDir
+  local tmpFile=`mktemp -t tmp.XXXXX`
+
+  profileDir=$(lvm dumpconfig | grep "profile_dir" | cut -d "=" -f2 | sed 's/"//g')
+  [ -n "$profileDir" ] || return 1
+
+  if [ ! -n "$POOL_AUTOEXTEND_THRESHOLD" ];then
+    echo "POOL_AUTOEXTEND_THRESHOLD not specified"
+    return 1
+  fi
+
+  if [ ! -n "$POOL_AUTOEXTEND_PERCENT" ];then
+    echo "POOL_AUTOEXTEND_PERCENT not specified"
+    return 1
+  fi
+
+cat <<EOF > $tmpFile
+activation {
+	thin_pool_autoextend_threshold=${POOL_AUTOEXTEND_THRESHOLD}
+	thin_pool_autoextend_percent=${POOL_AUTOEXTEND_PERCENT}
+
+}
+EOF
+  mv $tmpFile ${profileDir}/${profileFile}
+  lvchange --metadataprofile ${profileName}  ${volume_group}/${pool_volume}
+}
+
+disable_auto_pool_extension() {
+  local volume_group=$1
+  local pool_volume=$2
+  local profileName="${volume_group}--${pool_volume}-extend"
+  local profileFile="${profileName}.profile"
+  local profileDir
+
+  profileDir=$(lvm dumpconfig | grep "profile_dir" | cut -d "=" -f2 | sed 's/"//g')
+  [ -n "$profileDir" ] || return 1
+
+  lvchange --detachprofile ${volume_group}/${pool_volume}
+  rm -f ${profileDir}/${profileFile}
+}
 
 # Main Script
+if [ -e /usr/lib/docker-storage-setup/docker-storage-setup ]; then
+  source /usr/lib/docker-storage-setup/docker-storage-setup
+fi
+
+# If user has overridden any settings in /etc/sysconfig/docker-storage-setup
+# take that into account.
 if [ -e /etc/sysconfig/docker-storage-setup ]; then
   source /etc/sysconfig/docker-storage-setup
 fi
@@ -205,63 +303,12 @@ if [ -z "$DEVS" ] && [ -z "$VG_EXISTS" ]; then
   exit 1
 fi
 
-PVS=
-GROWPART=
-
 if [ -n "$DEVS" ] ; then
-  for dev in $DEVS; do
-    if expr match $dev ".*[0-9]"; then
-      echo "Partition specification unsupported at this time." >&2
-      exit 1
-    fi
-    if [[ $dev != /dev/* ]]; then
-      dev=/dev/$dev
-    fi
-    # Use a single partition of a whole device
-    # TODO:
-    #   * Consider gpt, or unpartitioned volumes
-    #   * Error handling when partition(s) already exist
-    #   * Deal with loop/nbd device names. See growpart code
-    PARTS=$( awk "\$4 ~ /"$( basename $dev )"[0-9]/ { print \$4 }" /proc/partitions )
-    if [ -n "$PARTS" ]; then
-      echo "$dev has partitions: $PARTS"
-      exit 1
-    fi
-    size=$(( $( awk "\$4 ~ /"$( basename $dev )"/ { print \$3 }" /proc/partitions ) * 2 - 2048 ))
-    cat <<EOF | sfdisk $dev
-unit: sectors
-
-${dev}1 : start=     2048, size=  ${size}, Id=8e
-EOF
-    pvcreate ${dev}1
-    PVS="$PVS ${dev}1"
-  done
-
-  if [ -z "$VG_EXISTS" ]; then
-    vgcreate $VG $PVS
-  else
-    # TODO:
-    #   * Error handling when PV is already part of a VG
-    vgextend $VG $PVS
-  fi
-  GROWPART=1
-elif [ "$ROOT_VG" == "$VG" ]; then
-  GROWPART=1
+  create_disk_partitions
+  create_extend_volume_group
 fi
 
-# Note that growpart is only variable here because we may someday support
-# using separate partitions on the same disk.  Today we fail early in that
-# case.  Also note that the way we are doing this, it should support LVM
-# RAID for the root device.  In the mirrored or striped case, we are growing
-# partitions on all disks, so as long as they match, growing the LV should
-# also work.
-if [ -n "$GROWPART" ]; then
-  for pv in $ROOT_PVS; do
-    # Split device & partition.  Ick.
-    growpart $( echo $pv | sed -r 's/([^0-9]*)([0-9]+)/\1 \2/' ) || true
-    pvresize $pv
-  done
-fi
+grow_root_pvs
 
 # NB: We are growing root here first, because when root and docker share a
 # disk, we'll default to giving docker "everything else."  This will be a
@@ -274,4 +321,10 @@ fi
 
 # Set up lvm thin pool LV
 setup_lvm_thin_pool
-write_storage_config_file
+
+# Enable or disable automatic pool extension
+if [ "$AUTO_EXTEND_POOL" == "yes" ];then
+  enable_auto_pool_extension ${VG} ${POOL_LV_NAME}
+else
+  disable_auto_pool_extension ${VG} ${POOL_LV_NAME}
+fi
