@@ -194,6 +194,32 @@ is_old_data_meta_mode() {
   return 0
 }
 
+docker_storage_is_configured() {
+  if [ ! -f "$DOCKER_STORAGE" ];then
+    return 1
+  fi
+  if grep -q -e "^DOCKER_STORAGE_OPTIONS=.*-s " $DOCKER_STORAGE; then
+    return 0
+  fi
+  if grep -q -e "^DOCKER_STORAGE_OPTIONS=.*--storage-opt dm.thinpooldev" $DOCKER_STORAGE; then
+    return 0
+  fi
+  return 1
+}
+
+# If docker-storage-setup is introduced for systems already running Docker
+# using loopback, we shouldn't try to do anything.
+loopback_is_in_use() {
+    metadatapath=/var/lib/docker/devicemapper/metadata
+    if test -d "${metadatapath}"; then
+	return 1
+    fi
+    if test -f "${metadatapath}"; then
+	return 0;
+    fi
+    return 1
+}
+
 grow_root_pvs() {
   [ -x "/usr/bin/growpart" ] || return 0
 
@@ -315,6 +341,16 @@ fi
 if is_old_data_meta_mode; then
   echo "ERROR: Old mode of passing data and metadata logical volumes to docker is not supported. Exiting."
   exit 1
+fi
+
+# Avoid doing anything if the user has configured Docker on their own
+if docker_storage_is_configured; then
+  exit 0
+fi
+
+if loopback_is_in_use; then
+    echo "WARNING: Existing Docker loopback data found, not auto-configuring Docker for LVM thinpool" 1>&2
+    exit 0
 fi
 
 # Read mounts
