@@ -57,7 +57,6 @@ DOCKER_ROOT_VOLUME_SIZE=40%FREE
 _DOCKER_COMPAT_MODE=""
 _STORAGE_IN_FILE=""
 _STORAGE_OUT_FILE=""
-_STORAGE_DRIVERS="devicemapper overlay overlay2"
 
 # Command related variables
 _COMMAND_LIST="create activate deactivate remove list export add-dev"
@@ -429,6 +428,43 @@ check_docker_storage_metadata() {
   Error "Docker has been previously configured for use with devicemapper graph driver. Not creating a new thin pool as existing docker metadata will fail to work with it. Manual cleanup is required before this will succeed."
   Info "Docker state can be reset by stopping docker and by removing ${_DOCKER_METADATA_DIR} directory. This will destroy existing docker images and containers and all the docker metadata."
   exit 1
+}
+
+# See whether we can use overlay backend
+can_use_overlay() {
+    local mountroot=$1
+    fstype=$(stat -f -c '%T' $mountroot)
+    have_ftype=yes
+    case "$fstype" in
+        # For xfs, see https://bugzilla.redhat.com/show_bug.cgi?id=1288162#c8
+        xfs) if test "$(xfs_info $mountroot | grep -o 'ftype=[01]')" = "ftype=0"; then
+                 have_ftype=no
+                 Info "STORAGE_DRIVER=auto: XFS filesystem at ${mountroot} has ftype=0, cannot use overlay2 backend; consider separate volume (or OS reprovision)"
+                 Info "Selecting STORAGE_DRIVER=devicemapper"
+             fi
+             ;;
+       *)
+             # Punt and assume things are OK
+             ;;
+    esac
+    if test ${have_ftype} = yes; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# If STORAGE_DRIVER=auto, pick a backend, and update STORAGE_DRIVER
+select_auto_storage_driver() {
+    local mountroot=$1
+    if [ "$STORAGE_DRIVER" == "auto" ]; then
+        # See if overlay can be used
+        if can_use_overlay ${mountroot}; then
+            STORAGE_DRIVER="overlay2"
+        else
+            STORAGE_DRIVER="devicemapper"
+        fi
+    fi
 }
 
 systemd_escaped_filename () {
@@ -1002,13 +1038,9 @@ get_current_storage_options() {
 is_valid_storage_driver() {
   local driver=$1 d
 
-  # Empty driver is valid. That means user does not want us to setup any
-  # storage.
-  [ -z "$driver" ] && return 0
-
-  for d in $_STORAGE_DRIVERS;do
-    [ "$driver" == "$d" ] && return 0
-  done
+  case "$driver" in
+      ""|auto|devicemapper|overlay|overlay2) return 0;;
+  esac
 
   return 1
 }
@@ -1320,6 +1352,15 @@ setup_storage_compat() {
   if [ -n "$current_driver" ] && [ "$current_driver" != "$STORAGE_DRIVER" ];then
    Fatal "Storage is already configured with ${current_driver} driver. Can't configure it with ${STORAGE_DRIVER} driver. To override, remove ${_STORAGE_OUT_FILE} and retry."
   fi
+
+  # First expand `auto` if in use
+  local mountroot
+  if test -d ${_DOCKER_METADATA_DIR}; then
+      mountroot=$_DOCKER_METADATA_DIR
+  else
+      mountroot=/var
+  fi
+  select_auto_storage_driver "${mountroot}"
 
   # If a user decides to setup (a) and (b)/(c):
   # a) lvm thin pool for devicemapper.
@@ -1638,8 +1679,9 @@ activate_storage_driver() {
     return 1
   fi
 
-  [ "$driver" == "" ] && return 0
-  [ "$driver" == "overlay" -o "$driver" == "overlay2" ] && return 0
+  case "$driver" in
+      ""|auto|overlay|overlay2) return 0;;
+  esac
 
   if [ "$driver" == "devicemapper" ];then
     if ! activate_devicemapper $_M_CONTAINER_THINPOOL $_M_VG $_M_DEVICE_WAIT_TIMEOUT; then
@@ -1797,8 +1839,9 @@ deactivate_storage_driver() {
     return 1
   fi
 
-  [ "$driver" == "" ] && return 0
-  [ "$driver" == "overlay" -o "$driver" == "overlay2" ] && return 0
+  case "$driver" in
+      ""|auto|overlay|overlay2) return 0;;
+  esac
 
   if [ "$driver" == "devicemapper" ];then
     if ! deactivate_devicemapper $_M_CONTAINER_THINPOOL $_M_VG; then
@@ -2072,13 +2115,11 @@ list_config() {
 
   echo "STORAGE_DRIVER=$_M_STORAGE_DRIVER"
 
-  if [ "$_M_STORAGE_DRIVER" == "" ]; then
-    return 0
-  elif [ "$_M_STORAGE_DRIVER" == "overlay" ]  || [ "$_M_STORAGE_DRIVER" == "overlay2" ];then
-    list_overlay_params
-  else
-    list_devicemapper_params
-  fi
+  case "$_M_STORAGE_DRIVER" in
+      ""|auto) return 0;;
+      overlay|overlay2) list_overlay_params;;
+      devicemapper) list_devicemapper_params;;
+  esac
   return 0
 }
 
@@ -2297,9 +2338,15 @@ setup_lvm_thin_pool () {
   fi
 }
 
+# See also setup_storage_compat()
 setup_storage() {
   if ! is_valid_storage_driver $STORAGE_DRIVER;then
     Fatal "Invalid storage driver: ${STORAGE_DRIVER}."
+  fi
+
+  # First expand `auto` if in use
+  if test "${STORAGE_DRIVER}" = "auto"; then
+      Fatal "Cannot use STORAGE_DRIVER=auto in non-compatibility mode"
   fi
 
   # If a user decides to setup (a) and (b)/(c):
@@ -2310,8 +2357,9 @@ setup_storage() {
 
   # Set up lvm thin pool LV.
   if [ "$STORAGE_DRIVER" == "devicemapper" ]; then
-    setup_lvm_thin_pool
-  elif [ "$STORAGE_DRIVER" == "overlay" -o "$STORAGE_DRIVER" == "overlay2" ];then
+      setup_lvm_thin_pool
+  else
+      # Otherwise just write the config
       [ -n "$_STORAGE_OUT_FILE" ] && write_storage_config_file $STORAGE_DRIVER "$_STORAGE_OUT_FILE"
   fi
 

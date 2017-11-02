@@ -86,10 +86,15 @@ functionality to work properly.
 \f[B]Supported options for the configuration file\f[]:
 
 STORAGE_DRIVER:
-      Specify a storage driver to be used with container runtime.
-      Default: "devicemapper".
-      Valid values are overlay, overlay2 and "".
-      "" tells container-storage-setup to not perform any storage setup.
+      Specify a storage driver to be used with container runtime; the default
+      value will chosen by your OS vendor.
+      Known values are: devicemapper, overlay2, overlay, auto, and "".  The empty string ""
+      is used when you want to ensure container-storage-setup does not automatically
+      change configuration (for example, you want to do it manually).  The "auto" option
+      may be used when c-s-s is started by default (for example, Atomic Host);
+      when specified, c-s-s will choose a backend.  Currently, this will be "overlay2" if
+      supported by the kernel/filesystem at the target mount point, and if not, then
+      "devicemapper" will be used.
 
 CONTAINER_THINPOOL:
       Specify the thinpool name for the lvm thinpool. This is required
